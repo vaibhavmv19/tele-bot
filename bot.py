@@ -107,7 +107,7 @@ def menu():
          InlineKeyboardButton(text="👥 Refer", callback_data="ref")],
         [InlineKeyboardButton(text="🎬 Redeem", callback_data="wd")],
         [InlineKeyboardButton(text="📖 Guide", url="https://t.me/nfbotz/405")],
-        [InlineKeyboardButton(text="🔥 Proof", url="https://t.me/zovloo")]
+        [InlineKeyboardButton(text="🔥 Proof", url="https://t.me/netflixgiveawayx")]
     ])
 
 def back():
