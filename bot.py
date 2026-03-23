@@ -46,7 +46,7 @@ cur.execute("""CREATE TABLE IF NOT EXISTS files (
     file_id TEXT
 )""")
 
-cur.execute("INSERT OR IGNORE INTO settings VALUES ('cost','3')")
+cur.execute("INSERT OR IGNORE INTO settings VALUES ('cost','')")
 conn.commit()
 
 # ---------------- HELPERS ---------------- #
@@ -204,6 +204,7 @@ async def ref(c):
 @dp.callback_query(lambda c: c.data == "wd")
 async def wd(c):
     await c.answer()
+
     cost = get_cost()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -211,41 +212,56 @@ async def wd(c):
         [InlineKeyboardButton(text="⬅ Back", callback_data="home")]
     ])
 
+    await edit(c, f"""
+🎬 <b>Redeem</b>
+
+Netflix File = <b>{cost}</b> Points
+""", kb)
     await edit(c, "🎬 Redeem", kb)
 
 @dp.callback_query(lambda c: c.data == "nf")
 async def nf(c):
-    await c.answer("Processing...")
+    await c.answer("⏳ Processing...")
 
     uid = c.from_user.id
     pts = get_points(uid)
     cost = get_cost()
 
     cur.execute("SELECT last_withdraw FROM users WHERE user_id=?", (uid,))
-    last = cur.fetchone()[0]
+    row = cur.fetchone()
+    last = row[0] if row else 0
 
+    # ❌ Not enough points
     if pts < cost:
-        await edit(c, "❌ Not enough points", menu())
+        await edit(c, f"❌ You need {cost} points", menu())
         return
 
+    # ⏳ Cooldown
     if time.time() - last < 60:
-        await edit(c, "⏳ Wait 1 min", menu())
+        await edit(c, "⏳ Wait 1 minute", menu())
         return
 
+    # 📂 Get files
     cur.execute("SELECT file_id FROM files")
     files = cur.fetchall()
 
     if not files:
-        await edit(c, "⚠️ No files", menu())
+        await edit(c, "⚠️ No files uploaded", menu())
         return
 
-    file = random.choice(files)[0]
-    await bot.send_document(uid, file)
+    file_id = random.choice(files)[0]
 
-    cur.execute("UPDATE users SET points=points-?,last_withdraw=? WHERE user_id=?", (cost,int(time.time()),uid))
+    # 📤 Send file
+    await bot.send_document(uid, file_id)
+
+    # 💰 Deduct points
+    cur.execute(
+        "UPDATE users SET points = points - ?, last_withdraw = ? WHERE user_id=?",
+        (cost, int(time.time()), uid)
+    )
     conn.commit()
 
-    await edit(c, "✅ Sent", menu())
+    await edit(c, "✅ File sent successfully!", menu())
 
 # ---------------- ADMIN ---------------- #
 
@@ -265,11 +281,20 @@ async def delc(m):
     await m.answer("Deleted")
 
 @dp.message(Command("setcost"))
-async def cost(m):
-    if m.from_user.id != ADMIN_ID: return
-    cur.execute("UPDATE settings SET value=? WHERE key='cost'", (m.text.split()[1],))
+async def setcost(m):
+    if m.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        value = int(m.text.split()[1])
+    except:
+        await m.answer("Usage: /setcost 1")
+        return
+
+    cur.execute("UPDATE settings SET value=? WHERE key='cost'", (value,))
     conn.commit()
-    await m.answer("Updated")
+
+    await m.answer(f"✅ Cost set to {value}")
 
 @dp.message(F.document)
 async def upload(m):
