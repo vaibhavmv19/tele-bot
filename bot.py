@@ -308,6 +308,41 @@ async def msend(m):
         await safe_send(u[0], txt)
 
     await m.answer("✅ Broadcast sent")
+@dp.message(Command("addpoints"))
+async def add_points(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+
+    args = m.text.split()
+
+    if len(args) != 3:
+        await m.answer("Usage:\n/addpoints USER_ID AMOUNT")
+        return
+
+    try:
+        user_id = int(args[1])
+        amount = int(args[2])
+    except:
+        await m.answer("❌ Invalid input")
+        return
+
+    # check user exists
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if not cur.fetchone():
+        await m.answer("❌ User not found")
+        return
+
+    # add points
+    cur.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
+    conn.commit()
+
+    await m.answer(f"✅ Added {amount} points to {user_id}")
+
+    # notify user
+    try:
+        await bot.send_message(user_id, f"🎁 You received {amount} points from admin")
+    except:
+        pass
 
 # ---------------- RUN ---------------- #
 
