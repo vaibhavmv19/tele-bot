@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS channels (
 cur.execute("""
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id TEXT
+    file_id TEXT,
+    file_type TEXT
 )
 """)
 
@@ -169,7 +170,7 @@ async def wd(c):
 
 @dp.callback_query(lambda c: c.data == "nf")
 async def nf(c):
-    await c.answer()
+    await c.answer("⏳ Processing...")
 
     uid = c.from_user.id
     pts = get_points(uid)
@@ -185,19 +186,26 @@ async def nf(c):
         await c.message.edit_text("⏳ Wait 10 sec", reply_markup=menu())
         return
 
-    cur.execute("SELECT file_id FROM files")
+    cur.execute("SELECT file_id, file_type FROM files")
     files = cur.fetchall()
 
     if not files:
         await c.message.edit_text("⚠️ No files available", reply_markup=menu())
         return
 
-    file_id = random.choice(files)[0]
+    file_id, ftype = random.choice(files)
 
-    await bot.send_document(uid, file_id)
+    # 📤 Send file
+    if ftype == "txt":
+        await bot.send_document(uid, file_id, caption="📄 TXT File")
+    elif ftype == "json":
+        await bot.send_document(uid, file_id, caption="🧾 JSON File")
 
-    cur.execute("UPDATE users SET points=points-1,last_withdraw=? WHERE user_id=?",
-                (int(time.time()), uid))
+    # 💰 Deduct points
+    cur.execute(
+        "UPDATE users SET points = points - 1, last_withdraw=? WHERE user_id=?",
+        (int(time.time()), uid)
+    )
     conn.commit()
 
     await c.message.edit_text("✅ File sent!", reply_markup=menu())
@@ -229,15 +237,24 @@ async def list_channels(m):
 
 @dp.message(F.document)
 async def upload(m):
-    if m.from_user.id != ADMIN_ID: return
-
-    if not m.document.file_name.endswith(".txt"):
-        await m.answer("❌ Only TXT allowed")
+    if m.from_user.id != ADMIN_ID:
         return
 
-    cur.execute("INSERT INTO files (file_id) VALUES (?)", (m.document.file_id,))
+    file_name = m.document.file_name.lower()
+
+    if file_name.endswith(".txt"):
+        ftype = "txt"
+    elif file_name.endswith(".json"):
+        ftype = "json"
+    else:
+        await m.answer("❌ Only TXT or JSON allowed")
+        return
+
+    cur.execute("INSERT INTO files (file_id, file_type) VALUES (?, ?)",
+                (m.document.file_id, ftype))
     conn.commit()
-    await m.answer("✅ File added")
+
+    await m.answer(f"✅ {ftype.upper()} file added")
 
 @dp.message(Command("stats"))
 async def stats(m):
