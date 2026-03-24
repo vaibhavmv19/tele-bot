@@ -65,22 +65,29 @@ async def safe_send(uid, text):
         await bot.send_message(uid, text)
     except:
         pass
-
+        
 async def is_joined(uid, ch):
     try:
-        member = await bot.get_chat_member(chat_id=ch, user_id=uid)
+        member = await asyncio.wait_for(
+            bot.get_chat_member(chat_id=ch, user_id=uid),
+            timeout=5
+        )
         return member.status in ["member", "administrator", "creator"]
     except:
         return False
-
+        
 async def check_all(uid):
     cur.execute("SELECT channel_id FROM channels")
     channels = cur.fetchall()
+
     if not channels:
         return True
+
     for c in channels:
-        if not await is_joined(uid, c[0]):
+        joined = await is_joined(uid, c[0])
+        if not joined:
             return False
+
     return True
 
 # ---------------- UI ---------------- #
@@ -128,7 +135,13 @@ async def start(m: types.Message):
         )
         conn.commit()
 
-    if not await check_all(uid):
+    try:
+        joined_all = await check_all(uid)
+    except:
+        await m.answer("⚠️ Error checking channels. Try later.")
+        return
+
+    if not joined_all:
         await m.answer("🔒 Join all channels first:", reply_markup=join_kb())
         return
 
@@ -140,7 +153,6 @@ async def start(m: types.Message):
         return
 
     await m.answer(HOME, reply_markup=menu())
-
 # ---------------- VERIFY ---------------- #
 @dp.callback_query(lambda c: c.data == "verify")
 async def verify(c):
@@ -303,10 +315,30 @@ async def addpoints(m):
 
 @dp.message(Command("stats"))
 async def stats(m):
-    if m.from_user.id != ADMIN_ID: return
+    if m.from_user.id != ADMIN_ID:
+        return
+
+    # Total users
     cur.execute("SELECT COUNT(*) FROM users")
     users = cur.fetchone()[0]
-    await m.answer(f"Users: {users}")
+
+    # Verified users
+    cur.execute("SELECT COUNT(*) FROM users WHERE joined=1")
+    verified = cur.fetchone()[0]
+
+    # Total files
+    cur.execute("SELECT COUNT(*) FROM files")
+    files = cur.fetchone()[0]
+
+    text = f"""
+📊 Bot Statistics
+
+👤 Total Users: {users}
+✅ Verified Users: {verified}
+📁 Files: {files}
+"""
+
+    await m.answer(text)
 
 @dp.message(Command("msend"))
 async def msend(m):
