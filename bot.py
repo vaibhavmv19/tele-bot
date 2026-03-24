@@ -228,18 +228,13 @@ async def nf(c):
 
     await c.message.edit_text("✅ File sent", reply_markup=menu())
 # auto save
-@dp.message()
+@dp.message(lambda m: m.from_user.id == ADMIN_ID and m.document)
 async def auto_add_files(m: types.Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-
-    if not m.document:
-        return
-
     filename = m.document.file_name.lower()
 
     # Allow only txt and json
     if not (filename.endswith(".txt") or filename.endswith(".json")):
+        await m.answer("❌ Only TXT and JSON files allowed")
         return
 
     file_id = m.document.file_id
