@@ -227,7 +227,30 @@ async def nf(c):
         conn.commit()
 
     await c.message.edit_text("✅ File sent", reply_markup=menu())
+# auto redeem
+@dp.message()
+async def auto_add_file(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
 
+    if not m.document:
+        return
+
+    filename = m.document.file_name.lower()
+
+    if not (filename.endswith(".txt") or filename.endswith(".json")):
+        await m.answer("❌ Only TXT and JSON files allowed")
+        return
+
+    file_id = m.document.file_id
+
+    cur.execute(
+        "INSERT INTO files (file_id, file_type, sent_count) VALUES (?, ?, 0)",
+        (file_id, "doc")
+    )
+    conn.commit()
+
+    await m.answer("✅ File added to database")
 # ---------------- ADMIN ---------------- #
 @dp.message(Command("addchannel"))
 async def addc(m: types.Message):
