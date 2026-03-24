@@ -89,85 +89,85 @@ def join_kb():
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # ---------------- START ---------------- #
+# ---------------- START ---------------- #
+
 @dp.message(CommandStart())
 async def start(m: types.Message, command: CommandStart):
     uid = m.from_user.id
     ref = command.args
+
     ref_id = int(ref) if ref and ref.isdigit() else None
 
-    # create user
+    # check if user exists
     cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
-    if not cur.fetchone():
-        cur.execute("INSERT INTO users (user_id,referred_by) VALUES (?,?)", (uid, ref_id))
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute(
+            "INSERT INTO users (user_id, referred_by, joined, referred_counted) VALUES (?, ?, 0, 0)",
+            (uid, ref_id)
+        )
         conn.commit()
 
-        # notify referrer (joined but not verified)
+        # notify referrer (joined but NOT verified)
         if ref_id and ref_id != uid:
             name = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
-            await safe_send(ref_id, f"👤 {name} joined your link\n⏳ Not verified")
+            await safe_send(ref_id, f"👤 {name} joined via your link\n⏳ Not verified yet")
 
-    # ❌ DO NOT mark joined here
-
-    # check verification
+    # ALWAYS force join
     if not await check_all(uid):
-        await m.answer("🔒 Join all channels first", reply_markup=join_kb())
+        await m.answer("🔒 Join all channels first:", reply_markup=join_kb())
         return
 
-    # ✅ only mark joined AFTER verification
-    cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
-    conn.commit()
-
-    await m.answer("🔥 Welcome!", reply_markup=menu())
-# ---------------- VERIFY ---------------- #
-@dp.callback_query(lambda c: c.data == "verify")
-async def verify(c: types.CallbackQuery):
-    uid = c.from_user.id
-
-    if not await check_all(uid):
-        await c.answer("Join all channels first!", show_alert=True)
-        return
-
-    # get user data
-    cur.execute("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
-    data = cur.fetchone()
-
-    if not data:
-        await c.answer("Error", True)
-        return
-
-    ref_id, counted = data
-
-    # already verified
+    # if already joined before → allow
     cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
-    if cur.fetchone()[0] == 1:
-        await c.message.edit_text("✅ Already verified!", reply_markup=menu())
+    joined = cur.fetchone()[0]
+
+    if joined == 0:
+        await m.answer("⚠️ Click '✅ Joined' after joining channels", reply_markup=join_kb())
         return
 
-    # mark verified
-    cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
+    await m.answer(HOME, reply_markup=menu())
+# ---------------- VERIFY ---------------- #
+# ---------------- START ---------------- #
 
-    # 🎯 GIVE REFERRAL REWARD
-    if ref_id and ref_id != uid and counted == 0:
-        # ensure referrer exists
-        cur.execute("SELECT user_id FROM users WHERE user_id=?", (ref_id,))
-        if cur.fetchone():
+@dp.message(CommandStart())
+async def start(m: types.Message, command: CommandStart):
+    uid = m.from_user.id
+    ref = command.args
 
-            # give point
-            cur.execute("UPDATE users SET points = points + 1 WHERE user_id=?", (ref_id,))
+    ref_id = int(ref) if ref and ref.isdigit() else None
 
-            # mark counted
-            cur.execute("UPDATE users SET referred_counted=1 WHERE user_id=?", (uid,))
+    # check if user exists
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
+    exists = cur.fetchone()
 
-            # notify
-            try:
-                name = f"@{c.from_user.username}" if c.from_user.username else c.from_user.first_name
-                await bot.send_message(ref_id, f"🎉 {name} verified → +1 point")
-            except:
-                pass
+    if not exists:
+        cur.execute(
+            "INSERT INTO users (user_id, referred_by, joined, referred_counted) VALUES (?, ?, 0, 0)",
+            (uid, ref_id)
+        )
+        conn.commit()
 
-    conn.commit()
+        # notify referrer (joined but NOT verified)
+        if ref_id and ref_id != uid:
+            name = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
+            await safe_send(ref_id, f"👤 {name} joined via your link\n⏳ Not verified yet")
 
-    await c.message.edit_text("✅ Verified!", reply_markup=menu())
+    # ALWAYS force join
+    if not await check_all(uid):
+        await m.answer("🔒 Join all channels first:", reply_markup=join_kb())
+        return
+
+    # if already joined before → allow
+    cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
+    joined = cur.fetchone()[0]
+
+    if joined == 0:
+        await m.answer("⚠️ Click '✅ Joined' after joining channels", reply_markup=join_kb())
+        return
+
+    await m.answer(HOME, reply_markup=menu())
 # ---------------- MENU ---------------- #
 
 @dp.callback_query(lambda c: c.data == "bal")
