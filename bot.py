@@ -10,6 +10,14 @@ from aiogram.client.default import DefaultBotProperties
 BOT_TOKEN = "8744693542:AAHB_WPcHjbUcyfwa829VleyP7RP40O91tQ"
 ADMIN_ID = 7998012491
 
+HOME = """
+🏠 Welcome to Rewards Bot
+
+💰 Earn points by referrals
+🎬 Redeem Netflix files
+👥 Invite friends to earn more
+"""
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
@@ -60,14 +68,17 @@ async def safe_send(uid, text):
 
 async def is_joined(uid, ch):
     try:
-        m = await bot.get_chat_member(ch, uid)
-        return m.status in ["member","administrator","creator"]
+        member = await bot.get_chat_member(chat_id=ch, user_id=uid)
+        return member.status in ["member", "administrator", "creator"]
     except:
         return False
 
 async def check_all(uid):
     cur.execute("SELECT channel_id FROM channels")
-    for c in cur.fetchall():
+    channels = cur.fetchall()
+    if not channels:
+        return True
+    for c in channels:
         if not await is_joined(uid, c[0]):
             return False
     return True
@@ -88,7 +99,6 @@ def join_kb():
     kb.append([InlineKeyboardButton(text="✅ I Joined", callback_data="verify")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-
 # ---------------- START ---------------- #
 @dp.message(CommandStart())
 async def start(m: types.Message):
@@ -96,11 +106,9 @@ async def start(m: types.Message):
     args = m.text.split()
 
     ref_id = None
-    if len(args) > 1:
-        if args[1].isdigit():
-            ref_id = int(args[1])
+    if len(args) > 1 and args[1].isdigit():
+        ref_id = int(args[1])
 
-    # check if user exists
     cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
     exists = cur.fetchone()
 
@@ -115,12 +123,10 @@ async def start(m: types.Message):
             name = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
             await safe_send(ref_id, f"👤 {name} joined via your link\n⏳ Not verified yet")
 
-    # Force join
     if not await check_all(uid):
         await m.answer("🔒 Join all channels first:", reply_markup=join_kb())
         return
 
-    # check verified
     cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
     joined = cur.fetchone()[0]
 
@@ -129,6 +135,7 @@ async def start(m: types.Message):
         return
 
     await m.answer(HOME, reply_markup=menu())
+
 # ---------------- VERIFY ---------------- #
 @dp.callback_query(lambda c: c.data == "verify")
 async def verify(c):
@@ -138,11 +145,9 @@ async def verify(c):
         await c.answer("❌ Join all channels first", show_alert=True)
         return
 
-    # mark user as verified
     cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
     conn.commit()
 
-    # give referral points
     cur.execute("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
     ref_id, counted = cur.fetchone()
 
@@ -153,8 +158,8 @@ async def verify(c):
         await safe_send(ref_id, "🎉 Referral verified! +1 point")
 
     await c.message.edit_text("✅ Verified!", reply_markup=menu())
-# ---------------- MENU ---------------- #
 
+# ---------------- MENU ---------------- #
 @dp.callback_query(lambda c: c.data == "bal")
 async def bal(c):
     await c.answer()
@@ -171,8 +176,6 @@ async def ref(c):
 
     await c.message.edit_text(f"👥 Invite:\n<code>{link}</code>\nUsers: {n}", reply_markup=menu())
 
-# ---------------- REDEEM ---------------- #
-
 @dp.callback_query(lambda c: c.data == "wd")
 async def wd(c):
     await c.answer()
@@ -182,6 +185,12 @@ async def wd(c):
     ])
     await c.message.edit_text("🎬 Redeem\n1 Point = 1 File", reply_markup=kb)
 
+@dp.callback_query(lambda c: c.data == "home")
+async def home(c):
+    await c.answer()
+    await c.message.edit_text(HOME, reply_markup=menu())
+
+# ---------------- FILE REDEEM ---------------- #
 @dp.callback_query(lambda c: c.data == "nf")
 async def nf(c):
     await c.answer("⏳ Processing...")
@@ -209,13 +218,11 @@ async def nf(c):
 
     file_id, ftype = random.choice(files)
 
-    # 📤 Send file
     if ftype == "txt":
         await bot.send_document(uid, file_id, caption="📄 TXT File")
     elif ftype == "json":
         await bot.send_document(uid, file_id, caption="🧾 JSON File")
 
-    # 💰 Deduct points
     cur.execute(
         "UPDATE users SET points = points - 1, last_withdraw=? WHERE user_id=?",
         (int(time.time()), uid)
@@ -225,7 +232,6 @@ async def nf(c):
     await c.message.edit_text("✅ File sent!", reply_markup=menu())
 
 # ---------------- ADMIN ---------------- #
-
 @dp.message(Command("addchannel"))
 async def addc(m):
     if m.from_user.id != ADMIN_ID: return
@@ -233,13 +239,6 @@ async def addc(m):
     cur.execute("INSERT INTO channels VALUES (?,?)",(cid,link))
     conn.commit()
     await m.answer("✅ Added")
-
-@dp.message(Command("delchannel"))
-async def delc(m):
-    if m.from_user.id != ADMIN_ID: return
-    cur.execute("DELETE FROM channels WHERE channel_id=?", (m.text.split()[1],))
-    conn.commit()
-    await m.answer("✅ Deleted")
 
 @dp.message(Command("channels"))
 async def list_channels(m):
@@ -249,90 +248,9 @@ async def list_channels(m):
     text = "\n".join([f"{c[0]} | {c[1]}" for c in data])
     await m.answer(text if text else "No channels")
 
-@dp.message(F.document)
-async def upload(m):
-    if m.from_user.id != ADMIN_ID:
-        return
-
-    file_name = m.document.file_name.lower()
-
-    if file_name.endswith(".txt"):
-        ftype = "txt"
-    elif file_name.endswith(".json"):
-        ftype = "json"
-    else:
-        await m.answer("❌ Only TXT or JSON allowed")
-        return
-
-    cur.execute("INSERT INTO files (file_id, file_type) VALUES (?, ?)",
-                (m.document.file_id, ftype))
-    conn.commit()
-
-    await m.answer(f"✅ {ftype.upper()} file added")
-
-@dp.message(Command("stats"))
-async def stats(m):
-    if m.from_user.id != ADMIN_ID: return
-
-    cur.execute("SELECT COUNT(*) FROM users")
-    u = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users WHERE joined=1")
-    v = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM files")
-    f = cur.fetchone()[0]
-
-    await m.answer(f"👥 Users: {u}\n✅ Verified: {v}\n📂 Files: {f}")
-
-@dp.message(Command("msend"))
-async def msend(m):
-    if m.from_user.id != ADMIN_ID: return
-    txt = m.text.replace("/msend ","")
-
-    cur.execute("SELECT user_id FROM users WHERE joined=1")
-    for u in cur.fetchall():
-        await safe_send(u[0], txt)
-
-    await m.answer("✅ Broadcast sent")
-@dp.message(Command("addpoints"))
-async def add_points(m: types.Message):
-    if m.from_user.id != ADMIN_ID:
-        return
-
-    args = m.text.split()
-
-    if len(args) != 3:
-        await m.answer("Usage:\n/addpoints USER_ID AMOUNT")
-        return
-
-    try:
-        user_id = int(args[1])
-        amount = int(args[2])
-    except:
-        await m.answer("❌ Invalid input")
-        return
-
-    # check user exists
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-    if not cur.fetchone():
-        await m.answer("❌ User not found")
-        return
-
-    # add points
-    cur.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
-    conn.commit()
-
-    await m.answer(f"✅ Added {amount} points to {user_id}")
-
-    # notify user
-    try:
-        await bot.send_message(user_id, f"🎁 You received {amount} points from admin")
-    except:
-        pass
-
 # ---------------- RUN ---------------- #
-
 async def main():
-    print("🔥 ULTIMATE BOT RUNNING")
+    print("🔥 BOT RUNNING")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
