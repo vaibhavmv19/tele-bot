@@ -90,13 +90,15 @@ def join_kb():
 
 
 # ---------------- START ---------------- #
-
 @dp.message(CommandStart())
-async def start(m: types.Message, command: CommandStart):
+async def start(m: types.Message):
     uid = m.from_user.id
-    ref = command.args
+    args = m.text.split()
 
-    ref_id = int(ref) if ref and ref.isdigit() else None
+    ref_id = None
+    if len(args) > 1:
+        if args[1].isdigit():
+            ref_id = int(args[1])
 
     # check if user exists
     cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
@@ -109,17 +111,16 @@ async def start(m: types.Message, command: CommandStart):
         )
         conn.commit()
 
-        # notify referrer (joined but NOT verified)
         if ref_id and ref_id != uid:
             name = f"@{m.from_user.username}" if m.from_user.username else m.from_user.first_name
             await safe_send(ref_id, f"👤 {name} joined via your link\n⏳ Not verified yet")
 
-    # ALWAYS force join
+    # Force join
     if not await check_all(uid):
         await m.answer("🔒 Join all channels first:", reply_markup=join_kb())
         return
 
-    # if already joined before → allow
+    # check verified
     cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
     joined = cur.fetchone()[0]
 
@@ -128,7 +129,6 @@ async def start(m: types.Message, command: CommandStart):
         return
 
     await m.answer(HOME, reply_markup=menu())
-# ---------------- VERIFY ---------------- #
 # ---------------- VERIFY ---------------- #
 @dp.callback_query(lambda c: c.data == "verify")
 async def verify(c):
