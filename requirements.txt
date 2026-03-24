@@ -1,4 +1,3 @@
 aiogram==3.4.1
 sqlite3
 asyncio
-python-3.11.9
