@@ -93,10 +93,21 @@ def menu():
 
 def join_kb():
     cur.execute("SELECT channel_link FROM channels")
-    kb = [[InlineKeyboardButton(text="🔗 Join Channel", url=c[0])] for c in cur.fetchall()]
-    kb.append([InlineKeyboardButton(text="✅ I Joined", callback_data="verify")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+    channels = cur.fetchall()
 
+    buttons = []
+    for ch in channels:
+        buttons.append([InlineKeyboardButton(
+            text="🔗 Join Channel",
+            url=ch[0]
+        )])
+
+    buttons.append([InlineKeyboardButton(
+        text="✅ I Joined",
+        callback_data="verify"
+    )])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 # ---------------- START ---------------- #
 @dp.message(CommandStart())
 async def start(m: types.Message):
@@ -219,20 +230,36 @@ async def nf(c):
 
 # ---------------- ADMIN ---------------- #
 @dp.message(Command("addchannel"))
-async def addc(m):
-    if m.from_user.id != ADMIN_ID: return
-    _, cid, link = m.text.split()
-    cur.execute("INSERT INTO channels VALUES (?,?)",(cid,link))
-    conn.commit()
-    await m.answer("Channel added")
+async def addc(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
 
+    try:
+        data = m.text.split()
+        cid = data[1]
+        link = data[2]
+
+        cur.execute("INSERT INTO channels VALUES (?,?)", (cid, link))
+        conn.commit()
+
+        await m.answer("✅ Channel added")
+
+    except:
+        await m.answer("Usage:\n/addchannel -100xxxx https://t.me/channel")
+        
 @dp.message(Command("delchannel"))
-async def delc(m):
-    if m.from_user.id != ADMIN_ID: return
-    _, cid = m.text.split()
-    cur.execute("DELETE FROM channels WHERE channel_id=?",(cid,))
-    conn.commit()
-    await m.answer("Channel removed")
+async def delc(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        cid = m.text.split()[1]
+        cur.execute("DELETE FROM channels WHERE channel_id=?", (cid,))
+        conn.commit()
+        await m.answer("✅ Channel removed")
+    except:
+        await m.answer("Usage:\n/delchannel -100xxxx")
+        
 
 @dp.message(Command("channels"))
 async def channels(m):
