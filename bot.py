@@ -39,100 +39,218 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 # ─────────────────────────── DATABASE ──────────────────────────────── #
-# WAL mode + serialize all writes through a lock so concurrent async
-# handlers never share a cursor mid-query (was causing stats glitches).
+# Supports BOTH:
+#   • PostgreSQL  — when DATABASE_URL env var is set (Heroku / Railway)
+#   • SQLite      — local dev fallback
+#
+# On Heroku the filesystem is EPHEMERAL — bot.db resets every restart.
+# You MUST add Heroku Postgres addon and set DATABASE_URL for persistence.
 import threading
-_db_lock = threading.Lock()
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA synchronous=NORMAL")
+import os
 
-def db():
-    """Always return a fresh cursor — never share across async calls."""
-    return conn.cursor()
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
+    # Heroku postgres:// → postgresql:// fix
+    _pg_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    def _get_pg_conn():
+        return psycopg2.connect(_pg_url, sslmode="require")
+    _PH = "%s"          # PostgreSQL placeholder
+    print("🐘 Using PostgreSQL")
+else:
+    _PH = "?"           # SQLite placeholder
+    print("📁 Using SQLite (local)")
+
+_db_lock = threading.Lock()
+
+if not USE_POSTGRES:
+    _sqlite_conn = sqlite3.connect("bot.db", check_same_thread=False)
+    _sqlite_conn.execute("PRAGMA journal_mode=WAL")
+    _sqlite_conn.execute("PRAGMA synchronous=NORMAL")
+
+def _adapt_sql(sql: str) -> str:
+    """Convert ? placeholders to %s for PostgreSQL."""
+    if USE_POSTGRES:
+        return sql.replace("?", "%s")
+    return sql
 
 def db_execute(sql, params=()):
-    """Thread-safe single-statement execute + commit."""
+    sql = _adapt_sql(sql)
     with _db_lock:
-        c = db()
-        c.execute(sql, params)
-        conn.commit()
-        return c
+        if USE_POSTGRES:
+            conn = _get_pg_conn()
+            try:
+                with conn.cursor() as c:
+                    c.execute(sql, params)
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            c = _sqlite_conn.cursor()
+            c.execute(sql, params)
+            _sqlite_conn.commit()
 
 def db_fetchone(sql, params=()):
+    sql = _adapt_sql(sql)
     with _db_lock:
-        c = db()
-        c.execute(sql, params)
-        return c.fetchone()
+        if USE_POSTGRES:
+            conn = _get_pg_conn()
+            try:
+                with conn.cursor() as c:
+                    c.execute(sql, params)
+                    return c.fetchone()
+            finally:
+                conn.close()
+        else:
+            c = _sqlite_conn.cursor()
+            c.execute(sql, params)
+            return c.fetchone()
 
 def db_fetchall(sql, params=()):
+    sql = _adapt_sql(sql)
     with _db_lock:
-        c = db()
-        c.execute(sql, params)
-        return c.fetchall()
+        if USE_POSTGRES:
+            conn = _get_pg_conn()
+            try:
+                with conn.cursor() as c:
+                    c.execute(sql, params)
+                    return c.fetchall()
+            finally:
+                conn.close()
+        else:
+            c = _sqlite_conn.cursor()
+            c.execute(sql, params)
+            return c.fetchall()
 
 def db_run_many(statements):
-    """Run multiple SQL statements atomically in one transaction."""
+    """Run multiple statements in one atomic transaction."""
     with _db_lock:
-        c = db()
-        for sql, params in statements:
-            c.execute(sql, params)
-        conn.commit()
+        if USE_POSTGRES:
+            conn = _get_pg_conn()
+            try:
+                with conn.cursor() as c:
+                    for sql, params in statements:
+                        c.execute(_adapt_sql(sql), params)
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            c = _sqlite_conn.cursor()
+            for sql, params in statements:
+                c.execute(_adapt_sql(sql), params)
+            _sqlite_conn.commit()
 
-# Schema creation (safe at startup — no concurrency yet)
-_setup = conn.cursor()
-_setup.executescript("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    points INTEGER DEFAULT 0,
-    referred_by INTEGER,
-    joined INTEGER DEFAULT 0,
-    referred_counted INTEGER DEFAULT 0,
-    is_vip INTEGER DEFAULT 0,
-    join_verified_at INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS channels (
-    channel_id TEXT,
-    channel_link TEXT
-);
-CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id TEXT UNIQUE,
-    filename TEXT,
-    file_type TEXT,
-    sent_count INTEGER DEFAULT 0,
-    group_message_id INTEGER,
-    group_chat_id TEXT
-);
-CREATE TABLE IF NOT EXISTS user_files (
-    user_id INTEGER,
-    file_id TEXT,
-    PRIMARY KEY (user_id, file_id)
-);
-CREATE TABLE IF NOT EXISTS gen_log (
-    user_id INTEGER PRIMARY KEY,
-    last_gen INTEGER DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('file_group', '');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('storage_channel', '');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('netflix_gif_id', '');
-""")
-conn.commit()
-# Migration: add new columns to existing DBs safely
-for _col_sql in [
-    "ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0",
-    "ALTER TABLE users ADD COLUMN join_verified_at INTEGER DEFAULT 0",
-]:
-    try:
-        _setup.execute(_col_sql)
-        conn.commit()
-    except Exception:
-        pass
+def _init_schema():
+    """Create tables. Works for both SQLite and PostgreSQL."""
+    if USE_POSTGRES:
+        # PostgreSQL uses SERIAL, no AUTOINCREMENT keyword
+        stmts = [
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                points INTEGER DEFAULT 0,
+                referred_by BIGINT,
+                joined INTEGER DEFAULT 0,
+                referred_counted INTEGER DEFAULT 0,
+                is_vip INTEGER DEFAULT 0,
+                join_verified_at BIGINT DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS channels (
+                channel_id TEXT,
+                channel_link TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS files (
+                id SERIAL PRIMARY KEY,
+                file_id TEXT UNIQUE,
+                filename TEXT,
+                file_type TEXT,
+                sent_count INTEGER DEFAULT 0,
+                group_message_id BIGINT,
+                group_chat_id TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS user_files (
+                user_id BIGINT,
+                file_id TEXT,
+                PRIMARY KEY (user_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS gen_log (
+                user_id BIGINT PRIMARY KEY,
+                last_gen BIGINT DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )""",
+            "INSERT INTO settings (key, value) VALUES ('price', '0') ON CONFLICT DO NOTHING",
+            "INSERT INTO settings (key, value) VALUES ('file_group', '') ON CONFLICT DO NOTHING",
+            "INSERT INTO settings (key, value) VALUES ('storage_channel', '') ON CONFLICT DO NOTHING",
+            "INSERT INTO settings (key, value) VALUES ('netflix_gif_id', '') ON CONFLICT DO NOTHING",
+        ]
+        conn = _get_pg_conn()
+        try:
+            with conn.cursor() as c:
+                for s in stmts:
+                    c.execute(s)
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        # SQLite
+        _sqlite_conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            points INTEGER DEFAULT 0,
+            referred_by INTEGER,
+            joined INTEGER DEFAULT 0,
+            referred_counted INTEGER DEFAULT 0,
+            is_vip INTEGER DEFAULT 0,
+            join_verified_at INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS channels (
+            channel_id TEXT,
+            channel_link TEXT
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT UNIQUE,
+            filename TEXT,
+            file_type TEXT,
+            sent_count INTEGER DEFAULT 0,
+            group_message_id INTEGER,
+            group_chat_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS user_files (
+            user_id INTEGER,
+            file_id TEXT,
+            PRIMARY KEY (user_id, file_id)
+        );
+        CREATE TABLE IF NOT EXISTS gen_log (
+            user_id INTEGER PRIMARY KEY,
+            last_gen INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('file_group', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('storage_channel', '');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('netflix_gif_id', '');
+        """)
+        # Migrations
+        for col in [
+            "ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN join_verified_at INTEGER DEFAULT 0",
+        ]:
+            try:
+                _sqlite_conn.execute(col)
+                _sqlite_conn.commit()
+            except Exception:
+                pass
+
+_init_schema()
 
 JOIN_CACHE_SECONDS = 7 * 24 * 3600  # 1 week
 
@@ -154,11 +272,20 @@ def get_storage_channel():
     return r[0] if r and r[0] else None
 
 def get_netflix_gif_id():
+    # Priority: DB setting → env var NETFLIX_GIF_ID
     r = db_fetchone("SELECT value FROM settings WHERE key='netflix_gif_id'")
-    return r[0] if r and r[0] else None
+    if r and r[0]:
+        return r[0]
+    return os.environ.get("NETFLIX_GIF_ID", "")  # fallback env var
 
 def set_setting(key, value):
-    db_execute("UPDATE settings SET value=? WHERE key=?", (value, key))
+    if USE_POSTGRES:
+        db_execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            (key, value)
+        )
+    else:
+        db_execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
 def get_verified_referrals(uid):
     r = db_fetchone(
@@ -176,6 +303,7 @@ def is_vip(uid):
 
 def user_cooldown_seconds(uid):
     return GEN_COOLDOWN_VIP if is_vip(uid) else GEN_COOLDOWN_SECONDS
+
 
 async def safe_send(uid, text, **kwargs):
     try:
@@ -261,7 +389,14 @@ def back_kb():
 
 # ─────────────────────────── GIF UPLOADER ──────────────────────────── #
 async def ensure_netflix_gif() -> str | None:
-    """Upload Netflix.mp4 to storage on first boot, cache file_id."""
+    """
+    Returns a cached Telegram file_id for the Netflix intro animation.
+    Priority order:
+      1. DB settings table (persistent across restarts when using PostgreSQL)
+      2. NETFLIX_GIF_ID env var (set this on Heroku if you don't want to re-upload)
+      3. Upload from local Netflix.mp4/gif file (only works locally)
+    On Heroku: set NETFLIX_GIF_ID env var with the file_id after first upload.
+    """
     cached = get_netflix_gif_id()
     if cached:
         return cached
@@ -270,21 +405,20 @@ async def ensure_netflix_gif() -> str | None:
     if not storage:
         return None
 
-    for fname in ("Netflix.mp4", "netflix.mp4", "netflix.gif", "Netflix.gif"):
+    for fname in ("Netflix.mp4", "netflix.mp4", "Netflix.gif", "netflix.gif"):
         if os.path.exists(fname):
             try:
                 f = FSInputFile(fname)
                 sent = await bot.send_animation(
                     chat_id=storage,
                     animation=f,
-                    caption="🎬 Netflix Intro GIF",
+                    caption="🎬 Netflix Intro",
                     disable_notification=True,
                 )
                 fid = sent.animation.file_id
-                db_execute(
-                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('netflix_gif_id', ?)",
-                    (fid,)
-                )
+                set_setting("netflix_gif_id", fid)
+                print(f"[GIF] Uploaded and cached: {fid}")
+                print(f"[GIF] Set NETFLIX_GIF_ID={fid} as Heroku env var to avoid re-uploading")
                 return fid
             except Exception as e:
                 print(f"[GIF] upload failed: {e}")
@@ -870,13 +1004,17 @@ async def setgif(m: types.Message):
         return
     try:
         fid = m.text.split()[1]
-        db_execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('netflix_gif_id', ?)",
-            (fid,)
+        set_setting("netflix_gif_id", fid)
+        await m.answer(
+            f"✅ Netflix GIF set: <code>{fid}</code>\n\n"
+            f"💡 Also set <code>NETFLIX_GIF_ID={fid}</code> as a Heroku config var\n"
+            f"so it survives dyno restarts without needing /setgif again."
         )
-        await m.answer(f"✅ Netflix GIF set: <code>{fid}</code>")
     except Exception:
-        await m.answer("Usage: /setgif <file_id>\nOr place Netflix.mp4 in bot folder — auto-detected on startup.")
+        await m.answer(
+            "Usage: /setgif &lt;file_id&gt;\n\n"
+            "To get a file_id: forward the video/gif to @getidsbot"
+        )
 
 @dp.message(Command("setvip"))
 async def setvip(m: types.Message):
