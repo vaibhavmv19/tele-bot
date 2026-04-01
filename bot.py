@@ -13,6 +13,13 @@ from aiogram.client.default import DefaultBotProperties
 BOT_TOKEN = "8744693542:AAHB_WPcHjbUcyfwa829VleyP7RP40O91tQ"
 ADMIN_ID = 7998012491
 
+# ── HARDCODED CONFIG (bypass /addchannel, /setgroup, /setstorage) ── #
+HARDCODED_CHANNELS = [
+    ("-1003551705162", "https://t.me/netflixgiveawayx"),
+]
+HARDCODED_FILE_GROUP   = "-1003776151760"
+HARDCODED_STORAGE      = "-1003755778558"
+
 ALLOWED_EXTENSIONS = (".txt", ".json", ".xml", ".csv", ".log")
 MAX_USERS_PER_FILE = 3          # Cookie deleted after sent to 3 users
 GEN_REQUIRED_INVITES = 5        # Need 5 referrals to use /gen
@@ -265,11 +272,11 @@ def get_price():
 
 def get_file_group():
     r = db_fetchone("SELECT value FROM settings WHERE key='file_group'")
-    return r[0] if r and r[0] else None
+    return (r[0] if r and r[0] else None) or HARDCODED_FILE_GROUP or None
 
 def get_storage_channel():
     r = db_fetchone("SELECT value FROM settings WHERE key='storage_channel'")
-    return r[0] if r and r[0] else None
+    return (r[0] if r and r[0] else None) or HARDCODED_STORAGE or None
 
 def get_netflix_gif_id():
     # Priority: DB setting → env var NETFLIX_GIF_ID
@@ -334,10 +341,11 @@ async def check_all(uid):
         return True
 
     channels = db_fetchall("SELECT channel_id FROM channels")
-    if not channels:
+    channel_ids = [c[0] for c in channels] if channels else [ch[0] for ch in HARDCODED_CHANNELS]
+    if not channel_ids:
         return True
-    for c in channels:
-        if not await is_joined(uid, c[0]):
+    for cid in channel_ids:
+        if not await is_joined(uid, cid):
             return False
     return True
 
@@ -378,7 +386,8 @@ def menu():
 
 def join_kb():
     channels = db_fetchall("SELECT channel_link FROM channels")
-    buttons = [[InlineKeyboardButton(text="🔗 Join Channel", url=ch[0])] for ch in channels]
+    links = [ch[0] for ch in channels] if channels else [ch[1] for ch in HARDCODED_CHANNELS]
+    buttons = [[InlineKeyboardButton(text="🔗 Join Channel", url=link)] for link in links]
     buttons.append([InlineKeyboardButton(text="✅ I Joined", callback_data="verify")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
