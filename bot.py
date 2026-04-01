@@ -39,10 +39,49 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 # ─────────────────────────── DATABASE ──────────────────────────────── #
+# WAL mode + serialize all writes through a lock so concurrent async
+# handlers never share a cursor mid-query (was causing stats glitches).
+import threading
+_db_lock = threading.Lock()
 conn = sqlite3.connect("bot.db", check_same_thread=False)
-cur = conn.cursor()
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")
 
-cur.execute("""
+def db():
+    """Always return a fresh cursor — never share across async calls."""
+    return conn.cursor()
+
+def db_execute(sql, params=()):
+    """Thread-safe single-statement execute + commit."""
+    with _db_lock:
+        c = db()
+        c.execute(sql, params)
+        conn.commit()
+        return c
+
+def db_fetchone(sql, params=()):
+    with _db_lock:
+        c = db()
+        c.execute(sql, params)
+        return c.fetchone()
+
+def db_fetchall(sql, params=()):
+    with _db_lock:
+        c = db()
+        c.execute(sql, params)
+        return c.fetchall()
+
+def db_run_many(statements):
+    """Run multiple SQL statements atomically in one transaction."""
+    with _db_lock:
+        c = db()
+        for sql, params in statements:
+            c.execute(sql, params)
+        conn.commit()
+
+# Schema creation (safe at startup — no concurrency yet)
+_setup = conn.cursor()
+_setup.executescript("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     points INTEGER DEFAULT 0,
@@ -51,17 +90,11 @@ CREATE TABLE IF NOT EXISTS users (
     referred_counted INTEGER DEFAULT 0,
     is_vip INTEGER DEFAULT 0,
     join_verified_at INTEGER DEFAULT 0
-)
-""")
-
-cur.execute("""
+);
 CREATE TABLE IF NOT EXISTS channels (
     channel_id TEXT,
     channel_link TEXT
-)
-""")
-
-cur.execute("""
+);
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id TEXT UNIQUE,
@@ -70,89 +103,75 @@ CREATE TABLE IF NOT EXISTS files (
     sent_count INTEGER DEFAULT 0,
     group_message_id INTEGER,
     group_chat_id TEXT
-)
-""")
-
-cur.execute("""
+);
 CREATE TABLE IF NOT EXISTS user_files (
     user_id INTEGER,
     file_id TEXT,
     PRIMARY KEY (user_id, file_id)
-)
-""")
-
-cur.execute("""
+);
 CREATE TABLE IF NOT EXISTS gen_log (
     user_id INTEGER PRIMARY KEY,
     last_gen INTEGER DEFAULT 0
-)
-""")
-
-cur.execute("""
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
-)
+);
+INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('file_group', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('storage_channel', '');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('netflix_gif_id', '');
 """)
-
-cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0')")
-cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('file_group', '')")
-cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('storage_channel', '')")
-cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('netflix_gif_id', '')")
-# Migration: add join_verified_at if missing (existing DBs)
-try:
-    cur.execute("ALTER TABLE users ADD COLUMN join_verified_at INTEGER DEFAULT 0")
-except Exception:
-    pass
 conn.commit()
+# Migration: add new columns to existing DBs safely
+for _col_sql in [
+    "ALTER TABLE users ADD COLUMN is_vip INTEGER DEFAULT 0",
+    "ALTER TABLE users ADD COLUMN join_verified_at INTEGER DEFAULT 0",
+]:
+    try:
+        _setup.execute(_col_sql)
+        conn.commit()
+    except Exception:
+        pass
 
 JOIN_CACHE_SECONDS = 7 * 24 * 3600  # 1 week
 
 # ─────────────────────────── HELPERS ───────────────────────────────── #
 def get_points(uid):
-    cur.execute("SELECT points FROM users WHERE user_id=?", (uid,))
-    r = cur.fetchone()
+    r = db_fetchone("SELECT points FROM users WHERE user_id=?", (uid,))
     return r[0] if r else 0
 
 def get_price():
-    cur.execute("SELECT value FROM settings WHERE key='price'")
-    r = cur.fetchone()
+    r = db_fetchone("SELECT value FROM settings WHERE key='price'")
     return int(r[0]) if r else 0
 
 def get_file_group():
-    cur.execute("SELECT value FROM settings WHERE key='file_group'")
-    r = cur.fetchone()
+    r = db_fetchone("SELECT value FROM settings WHERE key='file_group'")
     return r[0] if r and r[0] else None
 
 def get_storage_channel():
-    cur.execute("SELECT value FROM settings WHERE key='storage_channel'")
-    r = cur.fetchone()
+    r = db_fetchone("SELECT value FROM settings WHERE key='storage_channel'")
     return r[0] if r and r[0] else None
 
 def get_netflix_gif_id():
-    cur.execute("SELECT value FROM settings WHERE key='netflix_gif_id'")
-    r = cur.fetchone()
+    r = db_fetchone("SELECT value FROM settings WHERE key='netflix_gif_id'")
     return r[0] if r and r[0] else None
 
 def set_setting(key, value):
-    cur.execute("UPDATE settings SET value=? WHERE key=?", (value, key))
-    conn.commit()
+    db_execute("UPDATE settings SET value=? WHERE key=?", (value, key))
 
 def get_verified_referrals(uid):
-    cur.execute(
-        "SELECT COUNT(*) FROM users WHERE referred_by=? AND joined=1",
-        (uid,)
+    r = db_fetchone(
+        "SELECT COUNT(*) FROM users WHERE referred_by=? AND joined=1", (uid,)
     )
-    return cur.fetchone()[0]
+    return r[0] if r else 0
 
 def get_gen_cooldown(uid):
-    cur.execute("SELECT last_gen FROM gen_log WHERE user_id=?", (uid,))
-    r = cur.fetchone()
+    r = db_fetchone("SELECT last_gen FROM gen_log WHERE user_id=?", (uid,))
     return r[0] if r else 0
 
 def is_vip(uid):
-    cur.execute("SELECT is_vip FROM users WHERE user_id=?", (uid,))
-    r = cur.fetchone()
+    r = db_fetchone("SELECT is_vip FROM users WHERE user_id=?", (uid,))
     return bool(r and r[0])
 
 def user_cooldown_seconds(uid):
@@ -182,15 +201,11 @@ async def is_joined(uid, ch):
 
 async def check_all(uid):
     """Returns True if user has verified join within the past week, or passes live check."""
-    # Check cache first — if verified within 1 week, skip live API calls
-    cur.execute("SELECT join_verified_at FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
+    row = db_fetchone("SELECT join_verified_at FROM users WHERE user_id=?", (uid,))
     if row and row[0] and (int(time.time()) - row[0]) < JOIN_CACHE_SECONDS:
         return True
 
-    # Live check against Telegram
-    cur.execute("SELECT channel_id FROM channels")
-    channels = cur.fetchall()
+    channels = db_fetchall("SELECT channel_id FROM channels")
     if not channels:
         return True
     for c in channels:
@@ -200,11 +215,10 @@ async def check_all(uid):
 
 async def mark_join_verified(uid):
     """Cache that user passed join check right now."""
-    cur.execute(
+    db_execute(
         "UPDATE users SET join_verified_at=? WHERE user_id=?",
         (int(time.time()), uid)
     )
-    conn.commit()
 
 def is_allowed_file(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
@@ -235,8 +249,7 @@ def menu():
     ])
 
 def join_kb():
-    cur.execute("SELECT channel_link FROM channels")
-    channels = cur.fetchall()
+    channels = db_fetchall("SELECT channel_link FROM channels")
     buttons = [[InlineKeyboardButton(text="🔗 Join Channel", url=ch[0])] for ch in channels]
     buttons.append([InlineKeyboardButton(text="✅ I Joined", callback_data="verify")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -268,11 +281,10 @@ async def ensure_netflix_gif() -> str | None:
                     disable_notification=True,
                 )
                 fid = sent.animation.file_id
-                cur.execute(
+                db_execute(
                     "INSERT OR REPLACE INTO settings (key, value) VALUES ('netflix_gif_id', ?)",
                     (fid,)
                 )
-                conn.commit()
                 return fid
             except Exception as e:
                 print(f"[GIF] upload failed: {e}")
@@ -312,15 +324,13 @@ async def save_file_to_db(file_bytes: bytes, filename: str, retries=3) -> str:
         await safe_send(ADMIN_ID, f"❌ Storage upload failed after {retries} retries: <code>{filename}</code>")
         return "error"
 
-    cur.execute("SELECT file_id FROM files WHERE file_id=?", (tg_file_id,))
-    if cur.fetchone():
+    if db_fetchone("SELECT file_id FROM files WHERE file_id=?", (tg_file_id,)):
         return "duplicate"
 
-    cur.execute(
+    db_execute(
         "INSERT OR IGNORE INTO files (file_id, filename, file_type, sent_count) VALUES (?,?,?,0)",
         (tg_file_id, filename, "doc"),
     )
-    conn.commit()
     return "saved"
 
 # ─────────────────────────── /START ────────────────────────────────── #
@@ -331,13 +341,8 @@ async def start(m: types.Message):
     ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
 
     # Register user
-    cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
-    if not cur.fetchone():
-        cur.execute(
-            "INSERT INTO users (user_id, referred_by) VALUES (?, ?)",
-            (uid, ref_id),
-        )
-        conn.commit()
+    if not db_fetchone("SELECT user_id FROM users WHERE user_id=?", (uid,)):
+        db_execute("INSERT INTO users (user_id, referred_by) VALUES (?, ?)", (uid, ref_id))
 
     # Step 1: Check channels (cached for 1 week once verified)
     if not await check_all(uid):
@@ -345,20 +350,16 @@ async def start(m: types.Message):
         return
 
     # Step 2: Mark joined + cache
-    cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
+    row = db_fetchone("SELECT joined FROM users WHERE user_id=?", (uid,))
     if not row or row[0] == 0:
-        # They passed live check but haven't been marked yet — mark now
-        cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
-        conn.commit()
+        db_execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
         await mark_join_verified(uid)
-        # Count referral
-        cur.execute("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
-        ref_row = cur.fetchone()
+        ref_row = db_fetchone("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
         if ref_row and ref_row[0] and ref_row[1] == 0:
-            cur.execute("UPDATE users SET points = points + 1 WHERE user_id=?", (ref_row[0],))
-            cur.execute("UPDATE users SET referred_counted = 1 WHERE user_id=?", (uid,))
-            conn.commit()
+            db_run_many([
+                ("UPDATE users SET points = points + 1 WHERE user_id=?", (ref_row[0],)),
+                ("UPDATE users SET referred_counted = 1 WHERE user_id=?", (uid,)),
+            ])
             refs = get_verified_referrals(ref_row[0])
             bonus = f"\n\n🍪 You now have <b>{refs}</b> invites — use /gen to get a cookie!" if refs >= GEN_REQUIRED_INVITES else ""
             await safe_send(ref_row[0], f"🎉 <b>New referral joined!</b> +1 point{bonus}")
@@ -387,16 +388,17 @@ async def verify(c: types.CallbackQuery):
         await c.answer("❌ Join all channels first!", show_alert=True)
         return
 
-    cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
-    conn.commit()
+    db_execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
     await mark_join_verified(uid)
 
-    cur.execute("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
-    ref_id, counted = cur.fetchone()
+    ref_row2 = db_fetchone("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
+    ref_id = ref_row2[0] if ref_row2 else None
+    counted = ref_row2[1] if ref_row2 else 1
     if ref_id and counted == 0:
-        cur.execute("UPDATE users SET points = points + 1 WHERE user_id=?", (ref_id,))
-        cur.execute("UPDATE users SET referred_counted = 1 WHERE user_id=?", (uid,))
-        conn.commit()
+        db_run_many([
+            ("UPDATE users SET points = points + 1 WHERE user_id=?", (ref_id,)),
+            ("UPDATE users SET referred_counted = 1 WHERE user_id=?", (uid,)),
+        ])
         refs = get_verified_referrals(ref_id)
         bonus = ""
         if refs >= GEN_REQUIRED_INVITES:
@@ -519,8 +521,7 @@ async def ref(c: types.CallbackQuery):
 async def _do_gen(uid: int, reply_func):
     """Core gen logic. reply_func(text, **kw) sends reply to user."""
     # Must be verified (joined=1 in DB)
-    cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
-    row = cur.fetchone()
+    row = db_fetchone("SELECT joined FROM users WHERE user_id=?", (uid,))
     if not row or row[0] == 0:
         await reply_func(
             "❌ <b>You haven't verified yet.</b>\nSend /start to join the required channels first.",
@@ -571,7 +572,7 @@ async def _do_gen(uid: int, reply_func):
         return
 
     # Pick a cookie not yet sent to this user, under max capacity
-    cur.execute("""
+    cookie = db_fetchone("""
         SELECT id, file_id, filename, sent_count
         FROM files
         WHERE sent_count < ?
@@ -581,7 +582,6 @@ async def _do_gen(uid: int, reply_func):
         ORDER BY RANDOM()
         LIMIT 1
     """, (MAX_USERS_PER_FILE, uid))
-    cookie = cur.fetchone()
 
     if not cookie:
         await reply_func(
@@ -622,18 +622,17 @@ async def _do_gen(uid: int, reply_func):
         await reply_func("❌ Error sending cookie. Please contact admin.")
         return
 
-    # Update records
-    cur.execute("INSERT OR IGNORE INTO user_files (user_id, file_id) VALUES (?,?)", (uid, file_id))
-    cur.execute("UPDATE files SET sent_count = sent_count + 1 WHERE id=?", (file_db_id,))
-    cur.execute("INSERT OR REPLACE INTO gen_log (user_id, last_gen) VALUES (?,?)", (uid, now))
-    conn.commit()
+    # Update records atomically
+    db_run_many([
+        ("INSERT OR IGNORE INTO user_files (user_id, file_id) VALUES (?,?)", (uid, file_id)),
+        ("UPDATE files SET sent_count = sent_count + 1 WHERE id=?", (file_db_id,)),
+        ("INSERT OR REPLACE INTO gen_log (user_id, last_gen) VALUES (?,?)", (uid, now)),
+    ])
 
     # Auto-delete cookie from pool after MAX_USERS_PER_FILE
-    cur.execute("SELECT sent_count FROM files WHERE id=?", (file_db_id,))
-    fc = cur.fetchone()
+    fc = db_fetchone("SELECT sent_count FROM files WHERE id=?", (file_db_id,))
     if fc and fc[0] >= MAX_USERS_PER_FILE:
-        cur.execute("DELETE FROM files WHERE id=?", (file_db_id,))
-        conn.commit()
+        db_execute("DELETE FROM files WHERE id=?", (file_db_id,))
 
     await reply_func(
         f"✅ <b>Cookie sent to your DM!</b>\n"
@@ -871,11 +870,10 @@ async def setgif(m: types.Message):
         return
     try:
         fid = m.text.split()[1]
-        cur.execute(
+        db_execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('netflix_gif_id', ?)",
             (fid,)
         )
-        conn.commit()
         await m.answer(f"✅ Netflix GIF set: <code>{fid}</code>")
     except Exception:
         await m.answer("Usage: /setgif <file_id>\nOr place Netflix.mp4 in bot folder — auto-detected on startup.")
@@ -887,8 +885,7 @@ async def setvip(m: types.Message):
         return
     try:
         uid = int(m.text.split()[1])
-        cur.execute("UPDATE users SET is_vip=1 WHERE user_id=?", (uid,))
-        conn.commit()
+        db_execute("UPDATE users SET is_vip=1 WHERE user_id=?", (uid,))
         await m.answer(f"✅ User <code>{uid}</code> is now VIP (2hr cooldown)")
         await safe_send(uid, "👑 <b>You're now VIP!</b> Your /gen cooldown is reduced to <b>2 hours</b>!")
     except Exception:
@@ -900,8 +897,7 @@ async def revokevip(m: types.Message):
         return
     try:
         uid = int(m.text.split()[1])
-        cur.execute("UPDATE users SET is_vip=0 WHERE user_id=?", (uid,))
-        conn.commit()
+        db_execute("UPDATE users SET is_vip=0 WHERE user_id=?", (uid,))
         await m.answer(f"✅ VIP revoked for <code>{uid}</code>")
     except Exception:
         await m.answer("Usage: /revokevip <user_id>")
@@ -913,8 +909,7 @@ async def resetgen(m: types.Message):
         return
     try:
         uid = int(m.text.split()[1])
-        cur.execute("DELETE FROM gen_log WHERE user_id=?", (uid,))
-        conn.commit()
+        db_execute("DELETE FROM gen_log WHERE user_id=?", (uid,))
         await m.answer(f"✅ Gen cooldown reset for <code>{uid}</code>")
         await safe_send(uid, "✅ Your /gen cooldown has been reset by admin! Use /gen now.")
     except Exception:
@@ -926,8 +921,7 @@ async def addc(m: types.Message):
         return
     try:
         data = m.text.split()
-        cur.execute("INSERT INTO channels VALUES (?,?)", (data[1], data[2]))
-        conn.commit()
+        db_execute("INSERT INTO channels VALUES (?,?)", (data[1], data[2]))
         await m.answer("✅ Join-wall channel added")
     except Exception:
         await m.answer("Usage:\n/addchannel -100xxxx https://t.me/channel")
@@ -938,8 +932,7 @@ async def delc(m: types.Message):
         return
     try:
         cid = m.text.split()[1]
-        cur.execute("DELETE FROM channels WHERE channel_id=?", (cid,))
-        conn.commit()
+        db_execute("DELETE FROM channels WHERE channel_id=?", (cid,))
         await m.answer("✅ Channel removed")
     except Exception:
         await m.answer("Usage:\n/delchannel -100xxxx")
@@ -948,8 +941,7 @@ async def delc(m: types.Message):
 async def channels_cmd(m: types.Message):
     if m.from_user.id != ADMIN_ID:
         return
-    cur.execute("SELECT * FROM channels")
-    data = cur.fetchall()
+    data = db_fetchall("SELECT * FROM channels")
     text = "\n".join([f"{c[0]} | {c[1]}" for c in data])
     await m.answer(text if text else "No channels added")
 
@@ -959,8 +951,7 @@ async def addpoints(m: types.Message):
         return
     try:
         _, uid, pts = m.text.split()
-        cur.execute("UPDATE users SET points = points + ? WHERE user_id=?", (pts, uid))
-        conn.commit()
+        db_execute("UPDATE users SET points = points + ? WHERE user_id=?", (pts, uid))
         await m.answer(f"✅ Added {pts} points to user {uid}")
     except Exception:
         await m.answer("Usage: /addpoints <user_id> <points>")
@@ -969,16 +960,11 @@ async def addpoints(m: types.Message):
 async def stats(m: types.Message):
     if m.from_user.id != ADMIN_ID:
         return
-    cur.execute("SELECT COUNT(*) FROM users")
-    users = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users WHERE joined=1")
-    verified = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM users WHERE is_vip=1")
-    vips = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM files")
-    files = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM gen_log")
-    gens = cur.fetchone()[0]
+    users    = db_fetchone("SELECT COUNT(*) FROM users")[0]
+    verified = db_fetchone("SELECT COUNT(*) FROM users WHERE joined=1")[0]
+    vips     = db_fetchone("SELECT COUNT(*) FROM users WHERE is_vip=1")[0]
+    files    = db_fetchone("SELECT COUNT(*) FROM files")[0]
+    gens     = db_fetchone("SELECT COUNT(*) FROM gen_log")[0]
     price = get_price()
     file_group = get_file_group() or "❌ Not set"
     storage = get_storage_channel() or "❌ Not set"
@@ -1001,8 +987,7 @@ async def stats(m: types.Message):
 async def list_files(m: types.Message):
     if m.from_user.id != ADMIN_ID:
         return
-    cur.execute("SELECT id, filename, sent_count FROM files ORDER BY id DESC LIMIT 50")
-    data = cur.fetchall()
+    data = db_fetchall("SELECT id, filename, sent_count FROM files ORDER BY id DESC LIMIT 50")
     if not data:
         await m.answer("📭 No cookies in DB")
         return
@@ -1018,13 +1003,11 @@ async def delfile(m: types.Message):
         return
     try:
         fid = int(m.text.split()[1])
-        cur.execute("SELECT filename FROM files WHERE id=?", (fid,))
-        row = cur.fetchone()
+        row = db_fetchone("SELECT filename FROM files WHERE id=?", (fid,))
         if not row:
             await m.answer("❌ Cookie not found")
             return
-        cur.execute("DELETE FROM files WHERE id=?", (fid,))
-        conn.commit()
+        db_execute("DELETE FROM files WHERE id=?", (fid,))
         await m.answer(f"✅ Deleted #{fid}: {row[0]}")
     except Exception:
         await m.answer("Usage: /delfile <id>")
@@ -1034,8 +1017,7 @@ async def msend(m: types.Message):
     if m.from_user.id != ADMIN_ID:
         return
     msg = m.text.replace("/msend ", "", 1)
-    cur.execute("SELECT user_id FROM users WHERE joined=1")
-    users = cur.fetchall()
+    users = db_fetchall("SELECT user_id FROM users WHERE joined=1")
     sent = 0
     for u in users:
         try:
