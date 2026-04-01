@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS users (
     referred_by INTEGER,
     joined INTEGER DEFAULT 0,
     referred_counted INTEGER DEFAULT 0,
-    is_vip INTEGER DEFAULT 0
+    is_vip INTEGER DEFAULT 0,
+    join_verified_at INTEGER DEFAULT 0
 )
 """)
 
@@ -98,7 +99,14 @@ cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price', '0')")
 cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('file_group', '')")
 cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('storage_channel', '')")
 cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('netflix_gif_id', '')")
+# Migration: add join_verified_at if missing (existing DBs)
+try:
+    cur.execute("ALTER TABLE users ADD COLUMN join_verified_at INTEGER DEFAULT 0")
+except Exception:
+    pass
 conn.commit()
+
+JOIN_CACHE_SECONDS = 7 * 24 * 3600  # 1 week
 
 # ─────────────────────────── HELPERS ───────────────────────────────── #
 def get_points(uid):
@@ -173,6 +181,14 @@ async def is_joined(uid, ch):
         return False
 
 async def check_all(uid):
+    """Returns True if user has verified join within the past week, or passes live check."""
+    # Check cache first — if verified within 1 week, skip live API calls
+    cur.execute("SELECT join_verified_at FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if row and row[0] and (int(time.time()) - row[0]) < JOIN_CACHE_SECONDS:
+        return True
+
+    # Live check against Telegram
     cur.execute("SELECT channel_id FROM channels")
     channels = cur.fetchall()
     if not channels:
@@ -181,6 +197,14 @@ async def check_all(uid):
         if not await is_joined(uid, c[0]):
             return False
     return True
+
+async def mark_join_verified(uid):
+    """Cache that user passed join check right now."""
+    cur.execute(
+        "UPDATE users SET join_verified_at=? WHERE user_id=?",
+        (int(time.time()), uid)
+    )
+    conn.commit()
 
 def is_allowed_file(name: str) -> bool:
     return any(name.lower().endswith(ext) for ext in ALLOWED_EXTENSIONS)
@@ -206,7 +230,6 @@ def menu():
             InlineKeyboardButton(text="👥 Invite", callback_data="ref"),
         ],
         [
-            InlineKeyboardButton(text="💰 Balance", callback_data="bal"),
             InlineKeyboardButton(text="ℹ️ Status", callback_data="status"),
         ],
     ])
@@ -307,6 +330,7 @@ async def start(m: types.Message):
     args = m.text.split()
     ref_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
 
+    # Register user
     cur.execute("SELECT user_id FROM users WHERE user_id=?", (uid,))
     if not cur.fetchone():
         cur.execute(
@@ -315,17 +339,29 @@ async def start(m: types.Message):
         )
         conn.commit()
 
+    # Step 1: Check channels (cached for 1 week once verified)
     if not await check_all(uid):
         await m.answer("🔒 <b>Join all channels first to continue:</b>", reply_markup=join_kb())
         return
 
+    # Step 2: Mark joined + cache
     cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
-    if cur.fetchone()[0] == 0:
-        await m.answer(
-            "⚠️ <b>Please join the channel then tap ✅ I Joined</b>",
-            reply_markup=join_kb()
-        )
-        return
+    row = cur.fetchone()
+    if not row or row[0] == 0:
+        # They passed live check but haven't been marked yet — mark now
+        cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
+        conn.commit()
+        await mark_join_verified(uid)
+        # Count referral
+        cur.execute("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
+        ref_row = cur.fetchone()
+        if ref_row and ref_row[0] and ref_row[1] == 0:
+            cur.execute("UPDATE users SET points = points + 1 WHERE user_id=?", (ref_row[0],))
+            cur.execute("UPDATE users SET referred_counted = 1 WHERE user_id=?", (uid,))
+            conn.commit()
+            refs = get_verified_referrals(ref_row[0])
+            bonus = f"\n\n🍪 You now have <b>{refs}</b> invites — use /gen to get a cookie!" if refs >= GEN_REQUIRED_INVITES else ""
+            await safe_send(ref_row[0], f"🎉 <b>New referral joined!</b> +1 point{bonus}")
 
     # Send Netflix GIF welcome
     gif_id = await ensure_netflix_gif()
@@ -338,10 +374,10 @@ async def start(m: types.Message):
                 reply_markup=menu(),
                 parse_mode="HTML",
             )
+            return
         except Exception:
-            await m.answer(HOME, reply_markup=menu())
-    else:
-        await m.answer(HOME, reply_markup=menu())
+            pass
+    await m.answer(HOME, reply_markup=menu())
 
 # ─────────────────────────── VERIFY ────────────────────────────────── #
 @dp.callback_query(lambda c: c.data == "verify")
@@ -353,6 +389,7 @@ async def verify(c: types.CallbackQuery):
 
     cur.execute("UPDATE users SET joined=1 WHERE user_id=?", (uid,))
     conn.commit()
+    await mark_join_verified(uid)
 
     cur.execute("SELECT referred_by, referred_counted FROM users WHERE user_id=?", (uid,))
     ref_id, counted = cur.fetchone()
@@ -479,15 +516,15 @@ async def ref(c: types.CallbackQuery):
     )
 
 # ─────────────────────────── /GEN COMMAND ──────────────────────────── #
-@dp.message(Command("gen"))
-async def gen_cmd(m: types.Message):
-    uid = m.from_user.id
-
-    # Must be verified
+async def _do_gen(uid: int, reply_func):
+    """Core gen logic. reply_func(text, **kw) sends reply to user."""
+    # Must be verified (joined=1 in DB)
     cur.execute("SELECT joined FROM users WHERE user_id=?", (uid,))
     row = cur.fetchone()
     if not row or row[0] == 0:
-        await m.answer("❌ <b>Please /start and join the required channels first.</b>")
+        await reply_func(
+            "❌ <b>You haven't verified yet.</b>\nSend /start to join the required channels first.",
+        )
         return
 
     # Check 5 invites
@@ -497,7 +534,7 @@ async def gen_cmd(m: types.Message):
         link = f"https://t.me/{bot_info.username}?start={uid}"
         need = GEN_REQUIRED_INVITES - refs
         bar = "🟢" * refs + "⬜" * need
-        await m.answer(
+        await reply_func(
             f"🔒 <b>Gen Locked</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Progress: {bar}\n"
@@ -523,7 +560,7 @@ async def gen_cmd(m: types.Message):
                 url=f"https://t.me/{UPSELL_HANDLE.lstrip('@')}"
             )]
         ])
-        await m.answer(
+        await reply_func(
             f"⏳ <b>Cooldown Active</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"Next cookie in: <b>{fmt_time(remaining)}</b>\n\n"
@@ -547,7 +584,7 @@ async def gen_cmd(m: types.Message):
     cookie = cur.fetchone()
 
     if not cookie:
-        await m.answer(
+        await reply_func(
             "😔 <b>No cookies available right now.</b>\n"
             "New stock is being added — check back soon! 🔄"
         )
@@ -555,7 +592,7 @@ async def gen_cmd(m: types.Message):
 
     file_db_id, file_id, filename, sent_count = cookie
 
-    # Send the cookie as animation (GIF) + document
+    # Send the cookie (GIF + document) to user's DM
     gif_id = await ensure_netflix_gif()
     try:
         if gif_id:
@@ -581,33 +618,24 @@ async def gen_cmd(m: types.Message):
                 f"<i>Next gen unlocks in {fmt_time(cooldown)}</i>"
             )
         )
-    except Exception as e:
-        await m.answer("❌ Error sending cookie. Please contact admin.")
+    except Exception:
+        await reply_func("❌ Error sending cookie. Please contact admin.")
         return
 
     # Update records
-    cur.execute(
-        "INSERT OR IGNORE INTO user_files (user_id, file_id) VALUES (?,?)",
-        (uid, file_id)
-    )
-    cur.execute(
-        "UPDATE files SET sent_count = sent_count + 1 WHERE id=?",
-        (file_db_id,)
-    )
-    cur.execute(
-        "INSERT OR REPLACE INTO gen_log (user_id, last_gen) VALUES (?,?)",
-        (uid, now)
-    )
+    cur.execute("INSERT OR IGNORE INTO user_files (user_id, file_id) VALUES (?,?)", (uid, file_id))
+    cur.execute("UPDATE files SET sent_count = sent_count + 1 WHERE id=?", (file_db_id,))
+    cur.execute("INSERT OR REPLACE INTO gen_log (user_id, last_gen) VALUES (?,?)", (uid, now))
     conn.commit()
 
     # Auto-delete cookie from pool after MAX_USERS_PER_FILE
     cur.execute("SELECT sent_count FROM files WHERE id=?", (file_db_id,))
-    row = cur.fetchone()
-    if row and row[0] >= MAX_USERS_PER_FILE:
+    fc = cur.fetchone()
+    if fc and fc[0] >= MAX_USERS_PER_FILE:
         cur.execute("DELETE FROM files WHERE id=?", (file_db_id,))
         conn.commit()
 
-    await m.answer(
+    await reply_func(
         f"✅ <b>Cookie sent to your DM!</b>\n"
         f"⏳ Next gen unlocks in <b>{fmt_time(cooldown)}</b>\n\n"
         f"🚀 Reduce to 2hr → {UPSELL_HANDLE} ({UPSELL_PRICE})",
@@ -617,11 +645,17 @@ async def gen_cmd(m: types.Message):
         ])
     )
 
+
+@dp.message(Command("gen"))
+async def gen_cmd(m: types.Message):
+    await _do_gen(m.from_user.id, m.answer)
+
+
 # Callback alias for gen from inline button
 @dp.callback_query(lambda c: c.data == "gen")
 async def gen_cb(c: types.CallbackQuery):
-    # Simulate message for gen_cmd
-    await gen_cmd(c.message)
+    await c.answer()  # dismiss loading spinner
+    await _do_gen(c.from_user.id, c.message.answer)
 
 # ─────────────────────────── DOCUMENT HANDLER ──────────────────────── #
 @dp.message(F.document)
